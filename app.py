@@ -16,7 +16,7 @@ st.set_page_config(
 
 # -------------------------------------------------------------
 # IDENTIDADE VISUAL PANASONIC DO BRASIL
-# Cores Oficiais: Panasonic Blue (#004098 / #0F4C81), Dark Navy (#002B49), Accent Cyan (#00A3E0)
+# Cores Oficiais: Panasonic Blue (#004098), Dark Navy (#002B49), Accent Cyan (#00A3E0)
 # -------------------------------------------------------------
 PANASONIC_BLUE = "#004098"
 PANASONIC_DARK = "#002B49"
@@ -85,7 +85,7 @@ st.markdown(f"""
 <div class="panasonic-header-container">
     <div>
         <div class="panasonic-title">Panasonic do Brasil | Gestão de Rede & Pós-Venda</div>
-        <div class="panasonic-subtitle">Acompanhamento Operacional de Ordens de Serviço, Controle de TAT, Rastreio de Peças e Gestão de Consultoras</div>
+        <div class="panasonic-subtitle">Acompanhamento Operacional de Ordens de Serviço, Controle de TAT, Conformidade CDC (30 Dias), Rastreio de Peças e Gestão de Consultoras</div>
     </div>
     <div class="panasonic-logo-text">Panasonic</div>
 </div>
@@ -118,7 +118,7 @@ with col_up2:
         - **Consultora Responsável:** ex. *Consultora*, *Responsável*, *Gestora*
         """)
 
-# Função de Leitura
+# Função de Leitura Resiliente
 def ler_arquivo(file):
     if file.name.endswith('.csv'):
         try:
@@ -199,6 +199,9 @@ if file_servico is not None:
             else: return "> 3 dias"
         df_sorted['Faixa_TAT'] = df_sorted['TAT_Dias'].apply(get_faixa)
 
+        # Indicador de Conformidade CDC (Prazo legal de até 30 dias)
+        df_sorted['Status_CDC'] = df_sorted['TAT_Dias'].apply(lambda d: "Dentro do Prazo (≤ 30d)" if d <= 30 else "Estouro CDC (> 30d)")
+
         # Flag de Peça
         c_pl = df_sorted.get('Código Peça Lançada', pd.Series(['']*len(df_sorted))).fillna('').astype(str).str.strip()
         c_pt = df_sorted.get('Codigo Troca de Peças', pd.Series(['']*len(df_sorted))).fillna('').astype(str).str.strip()
@@ -210,7 +213,7 @@ if file_servico is not None:
             st_val = str(row.get('Status Atual', '')).strip()
             dem_val = str(row.get('Tipo de Demanda', '')).strip().upper()
             if st_val == 'CANCELADA': return 'BAIXA'
-            if 'REINCIDENCIA' in dem_val or 'REINCIDÊNCIA' in dem_val: return 'CRÍTICA'
+            if 'REINCIDENCIA' in dem_val or 'REINCIDÊNCIA' in dem_val or row['TAT_Dias'] > 30: return 'CRÍTICA'
             if (row['Tem_Peca'] or row['TAT_Dias'] >= 3) and st_val not in ['CONCLUÍDA', 'FINALIZADA']: return 'ALTA'
             if st_val == 'CRIADA': return 'MÉDIA'
             return 'NORMAL'
@@ -225,19 +228,23 @@ if file_servico is not None:
     lista_consultoras = sorted(df_sorted['Consultora Responsável'].unique())
     sel_consultora = st.sidebar.selectbox("👩‍💼 Consultora Responsável:", ["TODAS"] + lista_consultoras)
 
-    # 2. NOVO: Filtro de Tipo de Demanda
+    # 2. Filtro de Tipo de Demanda
     lista_demandas = sorted(df_sorted['Tipo de Demanda'].dropna().astype(str).unique())
     sel_demanda = st.sidebar.multiselect("📋 Tipo de Demanda:", lista_demandas, default=[])
 
-    # 3. Filtro de Status
+    # 3. NOVO: Filtro de Conformidade CDC
+    lista_cdc = ["Dentro do Prazo (≤ 30d)", "Estouro CDC (> 30d)"]
+    sel_cdc = st.sidebar.multiselect("⚖️ Conformidade CDC (30 Dias):", lista_cdc, default=[])
+
+    # 4. Filtro de Status
     lista_status = sorted(df_sorted['Status Atual'].dropna().unique())
     sel_status = st.sidebar.multiselect("🚦 Status Operacional:", lista_status, default=[])
 
-    # 4. Filtro de Prioridade
+    # 5. Filtro de Prioridade
     lista_prio = ["CRÍTICA", "ALTA", "MÉDIA", "NORMAL", "BAIXA"]
     sel_prio = st.sidebar.multiselect("⚡ Nível de Prioridade:", lista_prio, default=[])
 
-    # 5. Filtro de UF
+    # 6. Filtro de UF
     ufs = sorted(df_sorted['Estado'].dropna().astype(str).str.upper().unique())
     sel_uf = st.sidebar.multiselect("📍 Estado (UF):", ufs, default=[])
 
@@ -247,6 +254,8 @@ if file_servico is not None:
         df_filtrado = df_filtrado[df_filtrado['Consultora Responsável'] == sel_consultora]
     if sel_demanda:
         df_filtrado = df_filtrado[df_filtrado['Tipo de Demanda'].isin(sel_demanda)]
+    if sel_cdc:
+        df_filtrado = df_filtrado[df_filtrado['Status_CDC'].isin(sel_cdc)]
     if sel_status:
         df_filtrado = df_filtrado[df_filtrado['Status Atual'].isin(sel_status)]
     if sel_prio:
@@ -255,7 +264,7 @@ if file_servico is not None:
         df_filtrado = df_filtrado[df_filtrado['Estado'].astype(str).str.upper().isin(sel_uf)]
 
     # -------------------------------------------------------------
-    # CARDS DE INDICADORES (KPIs)
+    # CARDS DE INDICADORES (KPIs) COM PRAZO CDC
     # -------------------------------------------------------------
     total_os = len(df_filtrado)
     tat_medio = df_filtrado['TAT_Dias'].mean() if total_os > 0 else 0
@@ -263,23 +272,48 @@ if file_servico is not None:
     com_pecas = df_filtrado[df_filtrado['Tem_Peca']].shape[0]
     criticas = df_filtrado[df_filtrado['Prioridade'] == 'CRÍTICA'].shape[0]
 
+    # Cálculo da taxa CDC (considerando ordens válidas, excluindo canceladas)
+    df_validas_cdc = df_filtrado[df_filtrado['Status Atual'] != 'CANCELADA']
+    total_validas_cdc = len(df_validas_cdc)
+    dentro_cdc_cnt = (df_validas_cdc['TAT_Dias'] <= 30).sum()
+    pct_cdc = (dentro_cdc_cnt / total_validas_cdc * 100) if total_validas_cdc > 0 else 0
+
     st.markdown(f"### 📌 Visão Consolidada: **{sel_consultora if sel_consultora != 'TODAS' else 'Toda a Rede Panasonic'}**")
     
-    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+    kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
     kpi1.metric("Total de Ordens", f"{total_os:,}".replace(",", "."))
     kpi2.metric("TAT Médio Geral", f"{tat_medio:.1f} dias")
-    kpi3.metric("OS em Aberto", f"{em_aberto:,}".replace(",", "."))
-    kpi4.metric("OS com Peças", f"{com_pecas:,}".replace(",", "."))
-    kpi5.metric("OS Críticas / Reincidência", f"{criticas:,}".replace(",", "."))
+    kpi3.metric("🎯 % Dentro CDC (≤30d)", f"{pct_cdc:.1f}%", help="Percentual de ordens com resolução ou tempo em aberto de até 30 dias corridos.")
+    kpi4.metric("OS em Aberto", f"{em_aberto:,}".replace(",", "."))
+    kpi5.metric("OS com Peças", f"{com_pecas:,}".replace(",", "."))
+    kpi6.metric("OS Críticas / Reincidência", f"{criticas:,}".replace(",", "."))
 
     st.divider()
 
     # -------------------------------------------------------------
-    # GRÁFICOS VISUAIS INTERATIVOS COM CORES PANASONIC
+    # GRÁFICOS VISUAIS INTERATIVOS
     # -------------------------------------------------------------
     g_col1, g_col2 = st.columns(2)
 
     with g_col1:
+        st.subheader("Conformidade com o Prazo CDC (30 Dias)")
+        df_cdc_cnt = df_filtrado['Status_CDC'].value_counts().reset_index()
+        df_cdc_cnt.columns = ['Status CDC', 'Quantidade']
+        fig_cdc = px.pie(
+            df_cdc_cnt,
+            names='Status CDC',
+            values='Quantidade',
+            hole=0.45,
+            color='Status CDC',
+            color_discrete_map={
+                'Dentro do Prazo (≤ 30d)': '#004098',
+                'Estouro CDC (> 30d)': '#EF4444'
+            }
+        )
+        fig_cdc.update_layout(height=340, margin=dict(l=20, r=20, t=30, b=20))
+        st.plotly_chart(fig_cdc, use_container_width=True)
+
+    with g_col2:
         st.subheader("Distribuição por Tipo de Demanda")
         df_dem_cnt = df_filtrado['Tipo de Demanda'].value_counts().head(7).reset_index()
         df_dem_cnt.columns = ['Tipo de Demanda', 'Quantidade']
@@ -290,30 +324,10 @@ if file_servico is not None:
             text='Quantidade',
             color_discrete_sequence=[PANASONIC_BLUE]
         )
-        fig_dem.update_layout(showlegend=False, height=350, margin=dict(l=20, r=20, t=30, b=20))
+        fig_dem.update_layout(showlegend=False, height=340, margin=dict(l=20, r=20, t=30, b=20))
         st.plotly_chart(fig_dem, use_container_width=True)
 
-    with g_col2:
-        st.subheader("Distribuição por Faixa de TAT")
-        df_tat_cnt = df_filtrado['Faixa_TAT'].value_counts().reset_index()
-        df_tat_cnt.columns = ['Faixa', 'Quantidade']
-        fig_tat = px.pie(
-            df_tat_cnt,
-            names='Faixa',
-            values='Quantidade',
-            hole=0.45,
-            color='Faixa',
-            color_discrete_map={
-                '0-1 dia': '#10B981',
-                '2 dias': '#00A3E0',
-                '3 dias': '#F59E0B',
-                '> 3 dias': '#EF4444'
-            }
-        )
-        fig_tat.update_layout(height=350, margin=dict(l=20, r=20, t=30, b=20))
-        st.plotly_chart(fig_tat, use_container_width=True)
-
-    # Gráfico dos Postos com Maior Volume
+    # Postos com Maior Volume
     if sel_consultora != "TODAS":
         st.subheader(f"🏢 Postos com Mais Demandas - {sel_consultora}")
     else:
@@ -337,10 +351,10 @@ if file_servico is not None:
     # -------------------------------------------------------------
     st.divider()
     st.subheader("🔍 Consulta Rápida de Atendimentos")
-    busca = st.text_input("Pesquise por OS, Ticket, Modelo, Tipo de Demanda, Cidade ou Peça:")
+    busca = st.text_input("Pesquise por OS, Ticket, Modelo, Tipo de Demanda, Posto, Cidade ou Peça:")
     
     colunas_exibir = [
-        'Prioridade', 'TAT_Dias', 'Faixa_TAT', 'Tem_Peca_Txt', 'Código OS', 'Número do Ticket',
+        'Prioridade', 'Status_CDC', 'TAT_Dias', 'Faixa_TAT', 'Tem_Peca_Txt', 'Código OS', 'Número do Ticket',
         'Tipo de Demanda', 'Consultora Responsável', 'Unidade (Digiteam)', 'Status Atual', 'Data de Criação',
         'Categoria do Produto', 'Modelo do Produto', 'Cidade', 'Estado'
     ]
@@ -355,7 +369,7 @@ if file_servico is not None:
     st.caption(f"Mostrando até 100 de {len(df_tabela)} ordens encontradas no filtro atual.")
 
     # -------------------------------------------------------------
-    # GERADOR DE EXCEL OFICIAL (.XLSX) NAS CORES DA PANASONIC
+    # GERADOR DE EXCEL OFICIAL (.XLSX) COM INDICADOR CDC
     # -------------------------------------------------------------
     st.divider()
     st.subheader("📥 Exportação de Planilhas Formatadas (Padrão Panasonic)")
@@ -368,7 +382,6 @@ if file_servico is not None:
         ws_base = wb.create_sheet(title=nome_aba_base)
         ws_pecas = wb.create_sheet(title="Controle de Peças")
 
-        # Azul Panasonic para os cabeçalhos do Excel
         COLOR_PANASONIC_EXCEL = "004098"
         WHITE = "FFFFFF"
         BORDER_GRAY = "D1D5DB"
@@ -381,11 +394,11 @@ if file_servico is not None:
         # Cabeçalho Base
         ws_base["A1"] = f"PANASONIC DO BRASIL - GESTÃO DE REDE & PÓS-VENDA"
         ws_base["A1"].font = font_title
-        ws_base["A2"] = "Acompanhamento Operacional | Ordenado do mais antigo para o mais novo | Métricas de TAT e Peças"
+        ws_base["A2"] = "Acompanhamento Operacional | Ordenado do mais antigo para o mais novo | Métricas de TAT, CDC e Peças"
         ws_base["A2"].font = font_sub
 
         headers_base = [
-            "Consultora Responsável", "Prioridade Operacional", "TAT Atual (Dias)", "Faixa de TAT", "Tem Peça Lançada?",
+            "Consultora Responsável", "Prioridade Operacional", "Status Prazo CDC (30d)", "TAT Atual (Dias)", "Faixa de TAT", "Tem Peça Lançada?",
             "Código da OS", "Ticket", "Tipo de Demanda", "Status Atual", "Data de Criação",
             "Data de Conclusão", "Categoria do Produto", "Modelo do Produto", "Unidade Técnica (Rede)",
             "Região / Cidade", "UF", "Técnico de Campo", "Código Peça Lançada", "Descrição Peça Lançada",
@@ -420,24 +433,33 @@ if file_servico is not None:
         for i in range(n_rows):
             r = i + 5
             dc = dt_criac_str[i]
-            f_tat = f'=IF(K{r}="", INT(TODAY()-DATEVALUE(LEFT(J{r},10))), INT(DATEVALUE(LEFT(K{r},10))-DATEVALUE(LEFT(J{r},10))))' if dc else 0
-            f_peca = f'=IF(OR(R{r}<>"", T{r}<>""), "SIM", "NÃO")'
-            f_prio = f'=IF(I{r}="CANCELADA", "BAIXA", IF(OR(ISNUMBER(SEARCH("REINCIDENCIA", H{r})), ISNUMBER(SEARCH("REINCIDÊNCIA", H{r}))), "CRÍTICA", IF(AND(E{r}="SIM", I{r}<>"FINALIZADA", I{r}<>"CONCLUÍDA"), "ALTA", IF(AND(C{r}>=3, I{r}<>"FINALIZADA", I{r}<>"CONCLUÍDA"), "ALTA", IF(I{r}="CRIADA", "MÉDIA", "NORMAL")))))'
-            f_faixa = f'=IF(C{r}<=1, "0-1 dia", IF(C{r}<=2, "2 dias", IF(C{r}<=3, "3 dias", "> 3 dias")))'
-            f_acao = f'=IF(OR(I{r}="CONCLUÍDA", I{r}="FINALIZADA"), "Encerrado com Sucesso", IF(I{r}="CANCELADA", "Verificar Motivo Cancelamento", IF(E{r}="SIM", "Cobrar Envio/Chegada de Peça na Unidade", IF(I{r}="CRIADA", "Atribuir Técnico e Agendar Atendimento", IF(I{r}="AGENDADA", "Acompanhar Deslocamento Técnico", "Monitorar Atendimento")))))'
+            # Mapeamento de colunas da linha:
+            # A: Consultora
+            # B: Prioridade
+            # C: Status Prazo CDC (30d) -> =IF(D{r}<=30, "Dentro do CDC", "ESTOURO CDC")
+            # D: TAT (Dias) -> Conclusão L vs Criação K
+            # E: Faixa TAT
+            # F: Tem Peça -> S ou U
+            # G: Código OS, H: Ticket, I: Demanda, J: Status, K: Criação, L: Conclusão
+            f_tat = f'=IF(L{r}="", INT(TODAY()-DATEVALUE(LEFT(K{r},10))), INT(DATEVALUE(LEFT(L{r},10))-DATEVALUE(LEFT(K{r},10))))' if dc else 0
+            f_cdc = f'=IF(D{r}<=30, "Dentro do CDC", "ESTOURO CDC")'
+            f_peca = f'=IF(OR(S{r}<>"", U{r}<>""), "SIM", "NÃO")'
+            f_prio = f'=IF(J{r}="CANCELADA", "BAIXA", IF(OR(ISNUMBER(SEARCH("REINCIDENCIA", I{r})), ISNUMBER(SEARCH("REINCIDÊNCIA", I{r})), D{r}>30), "CRÍTICA", IF(AND(F{r}="SIM", J{r}<>"FINALIZADA", J{r}<>"CONCLUÍDA"), "ALTA", IF(AND(D{r}>=3, J{r}<>"FINALIZADA", J{r}<>"CONCLUÍDA"), "ALTA", IF(J{r}="CRIADA", "MÉDIA", "NORMAL")))))'
+            f_faixa = f'=IF(D{r}<=1, "0-1 dia", IF(D{r}<=2, "2 dias", IF(D{r}<=3, "3 dias", "> 3 dias")))'
+            f_acao = f'=IF(OR(J{r}="CONCLUÍDA", J{r}="FINALIZADA"), "Encerrado com Sucesso", IF(J{r}="CANCELADA", "Verificar Motivo Cancelamento", IF(D{r}>30, "AÇÃO IMEDIATA: Estouro de Prazo CDC (Risco Jurídico/Troca)", IF(F{r}="SIM", "Cobrar Envio/Chegada de Peça na Unidade", IF(J{r}="CRIADA", "Atribuir Técnico e Agendar Atendimento", IF(J{r}="AGENDADA", "Acompanhar Deslocamento Técnico", "Monitorar Atendimento"))))))'
 
             ws_base.append([
-                cons_resp[i], f_prio, f_tat, f_faixa, f_peca, cod_os[i], ticket[i], demanda[i], status[i], dc, dt_concl_str[i],
+                cons_resp[i], f_prio, f_cdc, f_tat, f_faixa, f_peca, cod_os[i], ticket[i], demanda[i], status[i], dc, dt_concl_str[i],
                 cat[i], mod[i], unid[i], cid[i], uf[i], tec[i], c_pl[i], d_pl[i], c_pt[i], d_pt[i], sint[i], f_acao
             ])
 
-        ws_base.freeze_panes = "F5"
-        ws_base.auto_filter.ref = f"A4:W{n_rows+4}"
+        ws_base.freeze_panes = "G5"
+        ws_base.auto_filter.ref = f"A4:X{n_rows+4}"
         
         col_widths_base = {
-            "A": 22, "B": 20, "C": 14, "D": 13, "E": 16, "F": 18, "G": 14, "H": 28, "I": 18,
-            "J": 18, "K": 18, "L": 22, "M": 18, "N": 35, "O": 20, "P": 8, "Q": 25,
-            "R": 24, "S": 35, "T": 24, "U": 35, "V": 30, "W": 36
+            "A": 22, "B": 20, "C": 20, "D": 14, "E": 13, "F": 16, "G": 18, "H": 14, "I": 28, "J": 18,
+            "K": 18, "L": 18, "M": 22, "N": 18, "O": 35, "P": 20, "Q": 8, "R": 25,
+            "S": 24, "T": 35, "U": 24, "V": 35, "W": 30, "X": 40
         }
         for col_letter, width in col_widths_base.items():
             ws_base.column_dimensions[col_letter].width = width
@@ -468,10 +490,9 @@ if file_servico is not None:
         ws_pecas.auto_filter.ref = f"A4:L{count_p+4}"
         ws_pecas.freeze_panes = "D5"
 
-        # Aba Dashboard
+        # Aba Dashboard (Com Indicador do CDC)
         ws_dash.views.sheetView[0].showGridLines = True
-        ws_dash["A1"] = "PANASONIC DO BRASIL - PAINEL DE CONTROLE E GESTÃO DA REDE"
-        ws_dash["A1"].font = font_title
+        ws_dash["A1"] = "PANASONIC DO BRASIL - PAINEL DE CONTROLE E GESTÃO DA REDE"; ws_dash["A1"].font = font_title
 
         def add_kpi(ws, col, title, form, fmt="#,##0"):
             ws.cell(row=4, column=col, value=title).font = Font(name="Segoe UI", size=9, bold=True, color="6B7280")
@@ -489,11 +510,13 @@ if file_servico is not None:
             ws.merge_cells(start_row=4, start_column=col, end_row=4, end_column=col+1)
             ws.merge_cells(start_row=5, start_column=col, end_row=6, end_column=col+1)
 
-        add_kpi(ws_dash, 1, "TOTAL DE ORDENS", f'=COUNTA(\'{nome_aba_base}\'!F5:F{n_rows+4})')
-        add_kpi(ws_dash, 3, "TAT MÉDIO GERAL (DIAS)", f'=AVERAGE(\'{nome_aba_base}\'!C5:C{n_rows+4})', "0.0")
-        add_kpi(ws_dash, 5, "ORDENS EM ABERTO", f'=COUNTIF(\'{nome_aba_base}\'!I5:I{n_rows+4}, "<>CONCLUÍDA") - COUNTIF(\'{nome_aba_base}\'!I5:I{n_rows+4}, "FINALIZADA") - COUNTIF(\'{nome_aba_base}\'!I5:I{n_rows+4}, "CANCELADA")')
-        add_kpi(ws_dash, 7, "OS COM PEÇAS", f'=COUNTIF(\'{nome_aba_base}\'!E5:E{n_rows+4}, "SIM")')
-        add_kpi(ws_dash, 9, "REINCIDÊNCIAS / CRÍTICAS", f'=COUNTIF(\'{nome_aba_base}\'!B5:B{n_rows+4}, "CRÍTICA")')
+        # KPIs no Excel (6 Cards)
+        add_kpi(ws_dash, 1, "TOTAL DE ORDENS", f'=COUNTA(\'{nome_aba_base}\'!G5:G{n_rows+4})')
+        add_kpi(ws_dash, 3, "TAT MÉDIO GERAL (DIAS)", f'=AVERAGE(\'{nome_aba_base}\'!D5:D{n_rows+4})', "0.0")
+        add_kpi(ws_dash, 5, "🎯 % DENTRO CDC (≤ 30D)", f'=COUNTIF(\'{nome_aba_base}\'!C5:C{n_rows+4}, "Dentro do CDC") / MAX(1, COUNTA(\'{nome_aba_base}\'!C5:C{n_rows+4}))', "0.0%")
+        add_kpi(ws_dash, 7, "ORDENS EM ABERTO", f'=COUNTIF(\'{nome_aba_base}\'!J5:J{n_rows+4}, "<>CONCLUÍDA") - COUNTIF(\'{nome_aba_base}\'!J5:J{n_rows+4}, "FINALIZADA") - COUNTIF(\'{nome_aba_base}\'!J5:J{n_rows+4}, "CANCELADA")')
+        add_kpi(ws_dash, 9, "OS COM PEÇAS", f'=COUNTIF(\'{nome_aba_base}\'!F5:F{n_rows+4}, "SIM")')
+        add_kpi(ws_dash, 11, "REINCIDÊNCIAS / CRÍTICAS", f'=COUNTIF(\'{nome_aba_base}\'!B5:B{n_rows+4}, "CRÍTICA")')
 
         output = io.BytesIO()
         wb.save(output)
