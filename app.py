@@ -230,7 +230,6 @@ if file_servico is not None:
                     diff_seconds = (dt_fim[i] - r['dt_criacao']).total_seconds()
                     tat_dias.append(max(0, int(diff_seconds // 86400)))
                 else:
-                    # Ordem em aberto: calcula com a data da consulta
                     diff_seconds = (ts_referencia - r['dt_criacao']).total_seconds()
                     tat_dias.append(max(0, int(diff_seconds // 86400)))
             else:
@@ -432,16 +431,13 @@ if file_servico is not None:
     resumo_postos['Status_Meta'] = resumo_postos['Pct_10d'].apply(
         lambda x: "✅ Na Meta (≥ 62%)" if x >= META_10_DIAS else "❌ Ofensor (< 62%)"
     )
-    # Gap: quantas ordens adicionais em 10 dias seriam necessárias para atingir 62%
     resumo_postos['Gap_OS_Meta'] = resumo_postos.apply(
         lambda r: max(0, int(round((META_10_DIAS / 100.0 * r['Total_OS']) - r['OS_Ate_10d']))),
         axis=1
     )
 
-    # Filtrar apenas os ofensores
     df_ofensores = resumo_postos[resumo_postos['Pct_10d'] < META_10_DIAS].copy()
     
-    # Opção de filtro de volume mínimo
     c_filt_of1, c_filt_of2 = st.columns([2, 2])
     with c_filt_of1:
         min_ordens = st.slider(
@@ -481,7 +477,6 @@ if file_servico is not None:
                 color_continuous_scale='Reds_r'
             )
             fig_of.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
-            # Linha da Meta de 62%
             fig_of.add_vline(
                 x=META_10_DIAS,
                 line_dash="dash",
@@ -684,7 +679,6 @@ if file_servico is not None:
         for i in range(n_rows):
             r = i + 5
             dc = dt_criac_str[i]
-            # Fórmula do TAT: Se K (Conclusão) estiver vazia, calcula até a data de corte DATEVALUE("{data_corte_str}")
             f_tat = f'=IF(K{r}="", INT(DATEVALUE("{data_corte_str}")-DATEVALUE(LEFT(J{r},10))), INT(DATEVALUE(LEFT(K{r},10))-DATEVALUE(LEFT(J{r},10))))' if dc else 0
             f_faixa = f'=IF(D{r}<=10, "Até 10 dias (No Target)", IF(D{r}<=30, "11 a 30 dias (Alerta)", "> 30 dias (Estouro CDC)"))'
             f_peca = f'=IF(OR(R{r}<>"", T{r}<>""), "SIM", "NÃO")'
@@ -748,12 +742,22 @@ if file_servico is not None:
             ws.merge_cells(start_row=4, start_column=col, end_row=4, end_column=col+1)
             ws.merge_cells(start_row=5, start_column=col, end_row=6, end_column=col+1)
 
-        add_kpi(ws_dash, 1, "% ATÉ 10 DIAS (META ≥62%)", f'=COUNTIF(\'{nome_aba_base}\'!D5:D{n_rows+4}, "<=10") / MAX(1, COUNTA(\'{nome_aba_base}\'!D5:D{n_rows+4}))', "0.0%")
-        add_kpi(ws_dash, 3, "% ATÉ 30 DIAS (CDC)", f'=COUNTIF(\'{nome_aba_base}\'!D5:D{n_rows+4}, "<=30") / MAX(1, COUNTA(\'{nome_aba_base}\'!D5:D{n_rows+4}))', "0.0%")
-        add_kpi(ws_dash, 5, "TAT MÉDIO REPARO", f'=AVERAGEIFS(\'{nome_aba_base}\'!D5:D{n_rows+4}, \'{nome_aba_base}\'!I5:I{n_rows+4}, "CONCLUÍDA")', "0.0")
-        add_kpi(ws_dash, 7, "% REINCIDENTES", f'=(COUNTIF(\'{nome_aba_base}\'!H5:H{n_rows+4}, "*REINCIDENCIA*") + COUNTIF(\'{nome_aba_base}\'!H5:H{n_rows+4}, "*REINCIDÊNCIA*")) / MAX(1, COUNTA(\'{nome_aba_base}\'!H5:H{n_rows+4}))', "0.00%")
-        add_kpi(ws_dash, 9, "TOTAL DE ORDENS", f'=COUNTA(\'{nome_aba_base}\'!F5:F{n_rows+4})\', "#,##0")
-        add_kpi(ws_dash, 11, "ORDENS EM ABERTO", f'=COUNTIF(\'{nome_aba_base}\'!I5:I{n_rows+4}, "<>CONCLUÍDA") - COUNTIF(\'{nome_aba_base}\'!I5:I{n_rows+4}, "FINALIZADA") - COUNTIF(\'{nome_aba_base}\'!I5:I{n_rows+4}, "CANCELADA")', "#,##0")
+        n_fim = str(n_rows + 4)
+        aba = str(nome_aba_base)
+        
+        f_kpi_10d = '=COUNTIF(\'' + aba + '\'!D5:D' + n_fim + ', "<=10") / MAX(1, COUNTA(\'' + aba + '\'!D5:D' + n_fim + '))'
+        f_kpi_30d = '=COUNTIF(\'' + aba + '\'!D5:D' + n_fim + ', "<=30") / MAX(1, COUNTA(\'' + aba + '\'!D5:D' + n_fim + '))'
+        f_kpi_reparo = '=AVERAGEIFS(\'' + aba + '\'!D5:D' + n_fim + ', \'' + aba + '\'!I5:I' + n_fim + ', "CONCLUÍDA")'
+        f_kpi_reinc = '=(COUNTIF(\'' + aba + '\'!H5:H' + n_fim + ', "*REINCIDENCIA*") + COUNTIF(\'' + aba + '\'!H5:H' + n_fim + ', "*REINCIDÊNCIA*")) / MAX(1, COUNTA(\'' + aba + '\'!H5:H' + n_fim + '))'
+        f_kpi_total = '=COUNTA(\'' + aba + '\'!F5:F' + n_fim + ')'
+        f_kpi_aberto = '=COUNTIF(\'' + aba + '\'!I5:I' + n_fim + ', "<>CONCLUÍDA") - COUNTIF(\'' + aba + '\'!I5:I' + n_fim + ', "FINALIZADA") - COUNTIF(\'' + aba + '\'!I5:I' + n_fim + ', "CANCELADA")'
+
+        add_kpi(ws_dash, 1, "% ATÉ 10 DIAS (META ≥62%)", f_kpi_10d, "0.0%")
+        add_kpi(ws_dash, 3, "% ATÉ 30 DIAS (CDC)", f_kpi_30d, "0.0%")
+        add_kpi(ws_dash, 5, "TAT MÉDIO REPARO", f_kpi_reparo, "0.0")
+        add_kpi(ws_dash, 7, "% REINCIDENTES", f_kpi_reinc, "0.00%")
+        add_kpi(ws_dash, 9, "TOTAL DE ORDENS", f_kpi_total, "#,##0")
+        add_kpi(ws_dash, 11, "ORDENS EM ABERTO", f_kpi_aberto, "#,##0")
 
         output = io.BytesIO()
         wb.save(output)
