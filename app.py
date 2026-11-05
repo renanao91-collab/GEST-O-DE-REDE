@@ -1,11 +1,13 @@
 import os
 import io
 import time
+from datetime import datetime, date
 import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 
 st.set_page_config(
     page_title="Panasonic do Brasil - Gestão de Rede & Pós-Venda",
@@ -22,6 +24,7 @@ PANASONIC_BLUE = "#004098"
 PANASONIC_DARK = "#002B49"
 PANASONIC_LIGHT_BG = "#F0F4F8"
 PANASONIC_ACCENT = "#00A3E0"
+META_10_DIAS = 62.0  # Meta estabelecida de 62% para atendimentos em até 10 dias
 
 st.markdown(f"""
 <style>
@@ -77,6 +80,24 @@ st.markdown(f"""
         color: {PANASONIC_BLUE} !important;
         font-weight: 700 !important;
     }}
+    .alerta-meta-ofensor {{
+        background-color: #FEE2E2;
+        border-left: 5px solid #EF4444;
+        padding: 12px 16px;
+        border-radius: 6px;
+        color: #991B1B;
+        margin-bottom: 15px;
+        font-weight: 500;
+    }}
+    .alerta-meta-atingida {{
+        background-color: #ECFDF5;
+        border-left: 5px solid #10B981;
+        padding: 12px 16px;
+        border-radius: 6px;
+        color: #065F46;
+        margin-bottom: 15px;
+        font-weight: 500;
+    }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -85,7 +106,7 @@ st.markdown(f"""
 <div class="panasonic-header-container">
     <div>
         <div class="panasonic-title">Panasonic do Brasil | Gestão de Rede & Pós-Venda</div>
-        <div class="panasonic-subtitle">Acompanhamento Operacional de Ordens de Serviço, Controle de TAT de Reparo, Metas CDC e Gestão por Consultoras</div>
+        <div class="panasonic-subtitle">Acompanhamento Operacional, Controle de SLA (Meta 10d ≥ 62%), Prazo CDC (30d), Diagnóstico de Postos Ofensores e Gestão por Consultoras</div>
     </div>
     <div class="panasonic-logo-text">Panasonic</div>
 </div>
@@ -130,10 +151,21 @@ def ler_arquivo(file):
         return pd.read_excel(file)
 
 # -------------------------------------------------------------
+# CONFIGURAÇÃO DE DATA DE CONSULTA NA BARRA LATERAL
+# -------------------------------------------------------------
+st.sidebar.markdown(f"<h3 style='color:{PANASONIC_BLUE};'>📅 Referência da Consulta</h3>", unsafe_allow_html=True)
+data_referencia = st.sidebar.date_input(
+    "Data de Corte / Consulta:",
+    value=date.today(),
+    help="Para ordens ainda NÃO finalizadas (sem data de conclusão), o tempo decorrido de atendimento é calculado com base nesta data."
+)
+ts_referencia = pd.Timestamp(data_referencia).normalize() + pd.Timedelta(hours=23, minutes=59, seconds=59)
+
+# -------------------------------------------------------------
 # PROCESSAMENTO DE DADOS
 # -------------------------------------------------------------
 if file_servico is not None:
-    with st.spinner("Processando ordens de serviço da rede Panasonic..."):
+    with st.spinner("Processando ordens de serviço da rede Panasonic com cálculo dinâmico de TAT..."):
         df_raw = ler_arquivo(file_servico)
         df_raw.columns = [c.replace('\ufeff', '').replace('"', '').strip() for c in df_raw.columns]
 
@@ -176,32 +208,42 @@ if file_servico is not None:
         else:
             df_sorted['Consultora Responsável'] = 'Não Atribuída (Insira a planilha 2)'
 
-        # Cálculo de TAT em dias
-        hoje = pd.Timestamp.now()
+        # CÁLCULO PRECISO DO TAT:
+        # Se tem Conclusão/Finalização: usa Data Conclusão - Data Criação
+        # Se NÃO tem Conclusão (Aberta/Pendente): usa Data de Referência (Consulta/Hoje) - Data Criação
         dt_fim = df_sorted['dt_conclusao'].fillna(df_sorted['dt_finalizacao'])
         
         tat_dias = []
         is_reparado = []
+        is_aberta = []
+        
         for i, r in df_sorted.iterrows():
             st_val = str(r.get('Status Atual', '')).strip().upper()
             reparado = st_val in ['CONCLUÍDA', 'FINALIZADA']
+            aberta = st_val not in ['CONCLUÍDA', 'FINALIZADA', 'CANCELADA']
+            
             is_reparado.append(reparado)
+            is_aberta.append(aberta)
             
             if pd.notna(r['dt_criacao']):
                 if pd.notna(dt_fim[i]):
-                    tat_dias.append(max(0, int((dt_fim[i] - r['dt_criacao']).total_seconds() // 86400)))
+                    diff_seconds = (dt_fim[i] - r['dt_criacao']).total_seconds()
+                    tat_dias.append(max(0, int(diff_seconds // 86400)))
                 else:
-                    tat_dias.append(max(0, int((hoje - r['dt_criacao']).total_seconds() // 86400)))
+                    # Ordem em aberto: calcula com a data da consulta
+                    diff_seconds = (ts_referencia - r['dt_criacao']).total_seconds()
+                    tat_dias.append(max(0, int(diff_seconds // 86400)))
             else:
                 tat_dias.append(0)
                 
         df_sorted['TAT_Dias'] = tat_dias
         df_sorted['Is_Reparado'] = is_reparado
+        df_sorted['Is_Aberta'] = is_aberta
 
-        # Faixas de TAT
+        # Faixas de Atendimento
         def get_faixa(d):
-            if d <= 10: return "Até 10 dias"
-            elif d <= 30: return "11 a 30 dias"
+            if d <= 10: return "Até 10 dias (No Target)"
+            elif d <= 30: return "11 a 30 dias (Alerta)"
             else: return "> 30 dias (Estouro CDC)"
         df_sorted['Faixa_TAT'] = df_sorted['TAT_Dias'].apply(get_faixa)
 
@@ -226,7 +268,7 @@ if file_servico is not None:
         df_sorted['Prioridade'] = df_sorted.apply(get_prioridade, axis=1)
 
     # -------------------------------------------------------------
-    # BARRA LATERAL: FILTROS OPERACIONAIS (SELEÇÃO MÚLTIPLA)
+    # BARRA LATERAL: FILTROS OPERACIONAIS
     # -------------------------------------------------------------
     st.sidebar.markdown(f"<h3 style='color:{PANASONIC_BLUE};'>🎯 Filtros Operacionais</h3>", unsafe_allow_html=True)
     
@@ -244,7 +286,7 @@ if file_servico is not None:
     sel_demanda = st.sidebar.multiselect("📋 Tipo de Demanda:", lista_demandas, default=[])
 
     # 3. Filtro de Faixa de Dias
-    faixas_opcoes = ["Até 10 dias", "11 a 30 dias", "> 30 dias (Estouro CDC)"]
+    faixas_opcoes = ["Até 10 dias (No Target)", "11 a 30 dias (Alerta)", "> 30 dias (Estouro CDC)"]
     sel_faixas = st.sidebar.multiselect("⏱️ Faixa de Dias (SLA / CDC):", faixas_opcoes, default=[])
 
     # 4. Filtro de Status
@@ -279,23 +321,24 @@ if file_servico is not None:
     # -------------------------------------------------------------
     total_os = len(df_filtrado)
     
-    # Base válida (desconsiderando ordens canceladas para apuração de qualidade da assistência)
+    # Base válida (desconsiderando canceladas)
     df_validas = df_filtrado[df_filtrado['Status Atual'] != 'CANCELADA']
     total_validas = len(df_validas)
     
     # 1. Percentual com até 10 dias
     qtd_ate_10 = (df_validas['TAT_Dias'] <= 10).sum()
     pct_ate_10 = (qtd_ate_10 / total_validas * 100) if total_validas > 0 else 0
+    delta_meta_10 = pct_ate_10 - META_10_DIAS
     
     # 2. Percentual com até 30 dias (CDC)
     qtd_ate_30 = (df_validas['TAT_Dias'] <= 30).sum()
     pct_ate_30 = (qtd_ate_30 / total_validas * 100) if total_validas > 0 else 0
     
-    # 3. TAT Médio de Reparo (Apenas ordens concluídas/finalizadas com reparo efetivo)
+    # 3. TAT Médio de Reparo (Concluídas/Finalizadas)
     df_reparadas = df_filtrado[df_filtrado['Is_Reparado']]
     tat_medio_reparo = df_reparadas['TAT_Dias'].mean() if len(df_reparadas) > 0 else 0
     
-    # 4. Percentual de atendimentos reincidentes
+    # 4. Percentual de Reincidentes
     qtd_reinc = df_validas['Is_Reincidente'].sum()
     pct_reinc = (qtd_reinc / total_validas * 100) if total_validas > 0 else 0
 
@@ -309,50 +352,169 @@ if file_servico is not None:
         nome_visao = "Toda a Rede Panasonic"
 
     st.markdown(f"### 📌 Painel de Indicadores Estratégicos: **{nome_visao}**")
-    
-    # Linha 1: Os 4 Indicadores Solicitados
+    st.caption(f"Cálculo com data de referência: **{data_referencia.strftime('%d/%m/%Y')}** (Ordens em aberto calculadas até esta data)")
+
+    # Banner informativo da Meta
+    if pct_ate_10 >= META_10_DIAS:
+        st.markdown(f"""
+        <div class="alerta-meta-atingida">
+            ✅ <b>META ATINGIDA:</b> O índice atual de atendimentos em até 10 dias é de <b>{pct_ate_10:.1f}%</b>, superando a meta estabelecida de <b>{META_10_DIAS:.1f}%</b> (+{delta_meta_10:.1f}% vs Target).
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div class="alerta-meta-ofensor">
+            ⚠️ <b>ABAIXO DA META:</b> O índice atual de atendimentos em até 10 dias é de <b>{pct_ate_10:.1f}%</b>, ficando abaixo da meta estipulada de <b>{META_10_DIAS:.1f}%</b> ({delta_meta_10:.1f}% vs Target).
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Linha 1: Os 4 Indicadores Estratégicos
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     kpi1.metric(
         "⚡ Atendimentos ≤ 10 Dias",
         f"{pct_ate_10:.1f}%",
-        f"{qtd_ate_10:,} de {total_validas:,} ordens válidas".replace(",", "."),
-        help="Percentual de ordens válidas atendidas em até 10 dias corridos."
+        f"{delta_meta_10:+.1f}% vs Meta (62%)",
+        help=f"Meta: ≥ {META_10_DIAS:.0f}%. Considera concluídas com TAT ≤ 10d e ordens em aberto com até 10d na data de corte."
     )
     kpi2.metric(
         "⚖️ Atendimentos ≤ 30 Dias (CDC)",
         f"{pct_ate_30:.1f}%",
         f"{qtd_ate_30:,} de {total_validas:,} ordens válidas".replace(",", "."),
-        help="Percentual de ordens dentro do limite legal de 30 dias do Artigo 18 do CDC."
+        help="Conformidade com o Artigo 18 do CDC (limite de 30 dias corridos)."
     )
     kpi3.metric(
         "🔧 TAT Médio de Reparo",
         f"{tat_medio_reparo:.1f} dias",
         f"{len(df_reparadas):,} ordens concluídas".replace(",", "."),
-        help="Tempo médio em dias para reparo e encerramento das ordens de serviço concluídas/finalizadas."
+        help="Tempo médio em dias para reparo efetivo das ordens concluídas/finalizadas."
     )
     kpi4.metric(
         "🔄 Taxa de Reincidência",
         f"{pct_reinc:.2f}%",
         f"{qtd_reinc:,} ordens reincidentes".replace(",", "."),
         delta_color="inverse",
-        help="Percentual de atendimentos identificados como reincidência na rede."
+        help="Percentual de atendimentos identificados como reincidência técnica na rede."
     )
 
-    # Linha 2: Métricas de Volume Complementares
+    # Linha 2: Métricas de Volume
     c_vol1, c_vol2, c_vol3, c_vol4 = st.columns(4)
-    em_aberto = df_filtrado[~df_filtrado['Status Atual'].isin(['CONCLUÍDA', 'FINALIZADA', 'CANCELADA'])].shape[0]
+    em_aberto = df_filtrado[df_filtrado['Is_Aberta']].shape[0]
     com_pecas = df_filtrado[df_filtrado['Tem_Peca']].shape[0]
     criticas = df_filtrado[df_filtrado['Prioridade'] == 'CRÍTICA'].shape[0]
 
     c_vol1.metric("Total de Ordens na Visão", f"{total_os:,}".replace(",", "."))
     c_vol2.metric("Ordens em Aberto", f"{em_aberto:,}".replace(",", "."))
     c_vol3.metric("Ordens com Peças Lançadas", f"{com_pecas:,}".replace(",", "."))
-    c_vol4.metric("Ordens Críticas / Reincidência", f"{criticas:,}".replace(",", "."))
+    c_vol4.metric("Ordens Críticas / Estouro", f"{criticas:,}".replace(",", "."))
 
     st.divider()
 
     # -------------------------------------------------------------
-    # GRÁFICOS VISUAIS INTERATIVOS
+    # SEÇÃO: DIAGNÓSTICO DOS POSTOS OFENSORES DA META (10 DIAS < 62%)
+    # -------------------------------------------------------------
+    st.subheader("🚨 Diagnóstico de Postos Ofensores (Atendimento em até 10 Dias < 62%)")
+    st.markdown("""
+    Esta análise identifica os postos autorizados que estão **puxando o indicador para baixo**. 
+    O cálculo considera o total de ordens válidas de cada posto e quanto falta para atingirem a meta de **62%**.
+    """)
+
+    # Agregação por Posto
+    df_validas_postos = df_validas.copy()
+    df_validas_postos['Ate_10d_Num'] = (df_validas_postos['TAT_Dias'] <= 10).astype(int)
+    
+    resumo_postos = df_validas_postos.groupby(['Unidade (Digiteam)', 'Consultora Responsável']).agg(
+        Total_OS=('Código OS', 'count'),
+        OS_Ate_10d=('Ate_10d_Num', 'sum'),
+        TAT_Medio=('TAT_Dias', 'mean')
+    ).reset_index()
+
+    resumo_postos['Pct_10d'] = (resumo_postos['OS_Ate_10d'] / resumo_postos['Total_OS']) * 100
+    resumo_postos['Status_Meta'] = resumo_postos['Pct_10d'].apply(
+        lambda x: "✅ Na Meta (≥ 62%)" if x >= META_10_DIAS else "❌ Ofensor (< 62%)"
+    )
+    # Gap: quantas ordens adicionais em 10 dias seriam necessárias para atingir 62%
+    resumo_postos['Gap_OS_Meta'] = resumo_postos.apply(
+        lambda r: max(0, int(round((META_10_DIAS / 100.0 * r['Total_OS']) - r['OS_Ate_10d']))),
+        axis=1
+    )
+
+    # Filtrar apenas os ofensores
+    df_ofensores = resumo_postos[resumo_postos['Pct_10d'] < META_10_DIAS].copy()
+    
+    # Opção de filtro de volume mínimo
+    c_filt_of1, c_filt_of2 = st.columns([2, 2])
+    with c_filt_of1:
+        min_ordens = st.slider(
+            "Filtrar postos com no mínimo de ordens:",
+            min_value=1,
+            max_value=max(10, int(resumo_postos['Total_OS'].max())) if len(resumo_postos) > 0 else 10,
+            value=5,
+            help="Postos com poucas ordens podem distorcer o percentual. Ajuste para focar nos maiores volumes."
+        )
+    
+    df_ofensores_view = df_ofensores[df_ofensores['Total_OS'] >= min_ordens].sort_values(
+        by=['Pct_10d', 'Total_OS'],
+        ascending=[True, False]
+    )
+
+    with c_filt_of2:
+        st.metric(
+            "Total de Postos Ofensores Identificados",
+            f"{len(df_ofensores_view)} postos",
+            f"{len(df_ofensores)} ofensores no total geral",
+            delta_color="inverse"
+        )
+
+    # Gráfico dos Maiores Ofensores
+    if len(df_ofensores_view) > 0:
+        col_g_of1, col_g_of2 = st.columns([3, 2])
+        with col_g_of1:
+            top_15_ofensores = df_ofensores_view.head(15).copy()
+            fig_of = px.bar(
+                top_15_ofensores,
+                x='Pct_10d',
+                y='Unidade (Digiteam)',
+                orientation='h',
+                text='Pct_10d',
+                title=f"Top 15 Postos Mais Críticos (% Atendimento ≤ 10 Dias)",
+                color='Pct_10d',
+                color_continuous_scale='Reds_r'
+            )
+            fig_of.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+            # Linha da Meta de 62%
+            fig_of.add_vline(
+                x=META_10_DIAS,
+                line_dash="dash",
+                line_color="#004098",
+                annotation_text="Meta 62%",
+                annotation_position="top right"
+            )
+            fig_of.update_layout(
+                yaxis={'categoryorder':'total descending'},
+                height=450,
+                xaxis_title="% de Atendimentos em até 10 Dias",
+                yaxis_title="Posto Autorizado",
+                margin=dict(l=20, r=20, t=40, b=20)
+            )
+            st.plotly_chart(fig_of, use_container_width=True)
+
+        with col_g_of2:
+            st.markdown("#### 📋 Tabela Detalhada de Postos Fora da Meta")
+            tabela_ofensores = df_ofensores_view[[
+                'Unidade (Digiteam)', 'Consultora Responsável', 'Total_OS', 'OS_Ate_10d', 'Pct_10d', 'Gap_OS_Meta'
+            ]].copy()
+            tabela_ofensores.columns = [
+                'Posto Autorizado', 'Consultora', 'Total OS', '≤ 10 Dias', '% Atingido', 'Déficit (OS p/ Meta)'
+            ]
+            tabela_ofensores['% Atingido'] = tabela_ofensores['% Atingido'].map(lambda x: f"{x:.1f}%")
+            st.dataframe(tabela_ofensores, use_container_width=True, height=410)
+    else:
+        st.success("🎉 Parabéns! Nenhum posto está abaixo da meta de 62% para os filtros e critérios selecionados.")
+
+    st.divider()
+
+    # -------------------------------------------------------------
+    # DEMAIS GRÁFICOS VISUAIS
     # -------------------------------------------------------------
     g_col1, g_col2 = st.columns(2)
 
@@ -367,8 +529,8 @@ if file_servico is not None:
             hole=0.45,
             color='Faixa de Atendimento',
             color_discrete_map={
-                'Até 10 dias': '#10B981',
-                '11 a 30 dias': '#00A3E0',
+                'Até 10 dias (No Target)': '#10B981',
+                '11 a 30 dias (Alerta)': '#00A3E0',
                 '> 30 dias (Estouro CDC)': '#EF4444'
             }
         )
@@ -389,23 +551,8 @@ if file_servico is not None:
         fig_dem.update_layout(showlegend=False, height=340, margin=dict(l=20, r=20, t=30, b=20))
         st.plotly_chart(fig_dem, use_container_width=True)
 
-    # Postos com Maior Volume da Seleção
-    st.subheader("🏢 Postos / Autorizadas com Mais Demandas")
-    top_unidades = df_filtrado['Unidade (Digiteam)'].value_counts().head(10).reset_index()
-    top_unidades.columns = ['Autorizada / Unidade', 'Ordens']
-    fig_unid = px.bar(
-        top_unidades,
-        x='Ordens',
-        y='Autorizada / Unidade',
-        orientation='h',
-        text='Ordens',
-        color_discrete_sequence=[PANASONIC_DARK]
-    )
-    fig_unid.update_layout(yaxis={'categoryorder':'total ascending'}, height=330, margin=dict(l=20, r=20, t=20, b=20))
-    st.plotly_chart(fig_unid, use_container_width=True)
-
     # -------------------------------------------------------------
-    # TABELA DINÂMICA DE CONSULTA
+    # TABELA DINÂMICA DE CONSULTA DE ORDENS
     # -------------------------------------------------------------
     st.divider()
     st.subheader("🔍 Consulta Rápida de Atendimentos")
@@ -427,16 +574,17 @@ if file_servico is not None:
     st.caption(f"Mostrando até 100 de {len(df_tabela)} ordens encontradas no filtro atual.")
 
     # -------------------------------------------------------------
-    # GERADOR DE EXCEL OFICIAL (.XLSX) COM AS MÉTRICAS SOLICITADAS
+    # GERADOR DE EXCEL OFICIAL (.XLSX) COM ABA DE OFENSORES
     # -------------------------------------------------------------
     st.divider()
     st.subheader("📥 Exportação de Planilhas Formatadas (Padrão Panasonic)")
 
-    def gerar_excel_completo(df_export, nome_aba_base="Controle Operacional OS"):
+    def gerar_excel_completo(df_export, df_ofensores_exp, nome_aba_base="Controle Operacional OS"):
         wb = openpyxl.Workbook()
         wb.remove(wb.active)
 
         ws_dash = wb.create_sheet(title="Dashboard Gestão")
+        ws_ofensores = wb.create_sheet(title="Postos Ofensores 10D")
         ws_base = wb.create_sheet(title=nome_aba_base)
         ws_pecas = wb.create_sheet(title="Controle de Peças")
 
@@ -447,12 +595,56 @@ if file_servico is not None:
         font_title = Font(name="Segoe UI", size=15, bold=True, color=COLOR_PANASONIC_EXCEL)
         font_sub = Font(name="Segoe UI", size=9, italic=True, color="4B5563")
         font_header = Font(name="Segoe UI", size=9, bold=True, color=WHITE)
+        font_bold = Font(name="Segoe UI", size=9, bold=True)
         fill_header = PatternFill(start_color=COLOR_PANASONIC_EXCEL, end_color=COLOR_PANASONIC_EXCEL, fill_type="solid")
+        fill_red = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
+        thin_border = Side(border_style="thin", color=BORDER_GRAY)
+        border_cell = Border(left=thin_border, right=thin_border, top=thin_border, bottom=thin_border)
 
-        # Cabeçalho Base
+        # 1. ABA DE POSTOS OFENSORES
+        ws_ofensores["A1"] = "PANASONIC DO BRASIL - POSTOS OFENSORES DO INDICADOR DE 10 DIAS"
+        ws_ofensores["A1"].font = font_title
+        ws_ofensores["A2"] = f"Meta Estabelecida: ≥ {META_10_DIAS:.0f}% de atendimentos em até 10 dias corridos | Data de Corte: {data_referencia.strftime('%d/%m/%Y')}"
+        ws_ofensores["A2"].font = font_sub
+
+        headers_of = ["Posto Autorizado (Unidade)", "Consultora Responsável", "Total de OS Válidas", "OS em até 10 Dias", "% Atingido", "Meta Target", "Status Meta", "Déficit de OS p/ Meta"]
+        for c_idx, h in enumerate(headers_of, 1):
+            c = ws_ofensores.cell(row=4, column=c_idx, value=h)
+            c.font = font_header; c.fill = fill_header; c.alignment = Alignment(horizontal="center", vertical="center")
+        ws_ofensores.row_dimensions[4].height = 26
+
+        for r_idx, r_data in enumerate(df_ofensores_exp.itertuples(), start=5):
+            ws_ofensores.cell(row=r_idx, column=1, value=r_data._1).border = border_cell
+            ws_ofensores.cell(row=r_idx, column=2, value=r_data._2).border = border_cell
+            
+            c3 = ws_ofensores.cell(row=r_idx, column=3, value=r_data.Total_OS)
+            c3.number_format = "#,##0"; c3.alignment = Alignment(horizontal="right"); c3.border = border_cell
+            
+            c4 = ws_ofensores.cell(row=r_idx, column=4, value=r_data.OS_Ate_10d)
+            c4.number_format = "#,##0"; c4.alignment = Alignment(horizontal="right"); c4.border = border_cell
+            
+            c5 = ws_ofensores.cell(row=r_idx, column=5, value=r_data.Pct_10d / 100.0)
+            c5.number_format = "0.0%"; c5.alignment = Alignment(horizontal="right"); c5.fill = fill_red; c5.font = font_bold; c5.border = border_cell
+            
+            c6 = ws_ofensores.cell(row=r_idx, column=6, value=META_10_DIAS / 100.0)
+            c6.number_format = "0.0%"; c6.alignment = Alignment(horizontal="right"); c6.border = border_cell
+            
+            c7 = ws_ofensores.cell(row=r_idx, column=7, value="OFENSOR (< 62%)")
+            c7.alignment = Alignment(horizontal="center"); c7.border = border_cell
+            
+            c8 = ws_ofensores.cell(row=r_idx, column=8, value=r_data.Gap_OS_Meta)
+            c8.number_format = "#,##0"; c8.alignment = Alignment(horizontal="right"); c8.border = border_cell
+            ws_ofensores.row_dimensions[r_idx].height = 20
+
+        ws_ofensores.freeze_panes = "C5"
+        ws_ofensores.auto_filter.ref = f"A4:H{len(df_ofensores_exp)+4}"
+        for col_l, w in {"A": 38, "B": 22, "C": 18, "D": 18, "E": 14, "F": 14, "G": 18, "H": 22}.items():
+            ws_ofensores.column_dimensions[col_l].width = w
+
+        # 2. ABA BASE
         ws_base["A1"] = f"PANASONIC DO BRASIL - GESTÃO DE REDE & PÓS-VENDA"
         ws_base["A1"].font = font_title
-        ws_base["A2"] = "Acompanhamento Operacional | Ordenado do mais antigo para o mais novo | Métricas de TAT, CDC e Peças"
+        ws_base["A2"] = f"Acompanhamento Operacional | Data de Corte: {data_referencia.strftime('%d/%m/%Y')} | Ordenado do mais antigo para o mais novo"
         ws_base["A2"].font = font_sub
 
         headers_base = [
@@ -488,19 +680,16 @@ if file_servico is not None:
         sint = df_export.get('Sintoma e Defeito', pd.Series(['']*n_rows)).fillna('').astype(str).str.strip().tolist()
         cons_resp = df_export['Consultora Responsável'].tolist()
 
+        data_corte_str = data_referencia.strftime('%Y-%m-%d')
         for i in range(n_rows):
             r = i + 5
             dc = dt_criac_str[i]
-            # Mapeamento de colunas:
-            # D: TAT Dias (Conclusão K vs Criação J)
-            # C: Faixa SLA
-            # E: Tem Peça
-            # B: Prioridade
-            f_tat = f'=IF(K{r}="", INT(TODAY()-DATEVALUE(LEFT(J{r},10))), INT(DATEVALUE(LEFT(K{r},10))-DATEVALUE(LEFT(J{r},10))))' if dc else 0
-            f_faixa = f'=IF(D{r}<=10, "Até 10 dias", IF(D{r}<=30, "11 a 30 dias", "> 30 dias (Estouro CDC)"))'
+            # Fórmula do TAT: Se K (Conclusão) estiver vazia, calcula até a data de corte DATEVALUE("{data_corte_str}")
+            f_tat = f'=IF(K{r}="", INT(DATEVALUE("{data_corte_str}")-DATEVALUE(LEFT(J{r},10))), INT(DATEVALUE(LEFT(K{r},10))-DATEVALUE(LEFT(J{r},10))))' if dc else 0
+            f_faixa = f'=IF(D{r}<=10, "Até 10 dias (No Target)", IF(D{r}<=30, "11 a 30 dias (Alerta)", "> 30 dias (Estouro CDC)"))'
             f_peca = f'=IF(OR(R{r}<>"", T{r}<>""), "SIM", "NÃO")'
             f_prio = f'=IF(I{r}="CANCELADA", "BAIXA", IF(OR(ISNUMBER(SEARCH("REINCIDENCIA", H{r})), ISNUMBER(SEARCH("REINCIDÊNCIA", H{r})), D{r}>30), "CRÍTICA", IF(AND(E{r}="SIM", I{r}<>"FINALIZADA", I{r}<>"CONCLUÍDA"), "ALTA", IF(AND(D{r}>=3, I{r}<>"FINALIZADA", I{r}<>"CONCLUÍDA"), "ALTA", IF(I{r}="CRIADA", "MÉDIA", "NORMAL")))))'
-            f_acao = f'=IF(OR(I{r}="CONCLUÍDA", I{r}="FINALIZADA"), "Encerrado com Sucesso", IF(I{r}="CANCELADA", "Verificar Motivo Cancelamento", IF(D{r}>30, "AÇÃO IMEDIATA: Estouro de Prazo CDC (Risco Jurídico/Troca)", IF(E{r}="SIM", "Cobrar Envio/Chegada de Peça na Unidade", IF(I{r}="CRIADA", "Atribuir Técnico e Agendar Atendimento", IF(I{r}="AGENDADA", "Acompanhar Deslocamento Técnico", "Monitorar Atendimento"))))))'
+            f_acao = f'=IF(OR(I{r}="CONCLUÍDA", I{r}="FINALIZADA"), "Encerrado com Sucesso", IF(I{r}="CANCELADA", "Verificar Motivo Cancelamento", IF(D{r}>30, "AÇÃO IMEDIATA: Estouro de Prazo CDC (Risco Jurídico/Troca)", IF(D{r}>10, "ATENÇÃO: Fora da Meta de 10 Dias - Priorizar Atendimento", IF(E{r}="SIM", "Cobrar Envio/Chegada de Peça na Unidade", IF(I{r}="CRIADA", "Atribuir Técnico e Agendar Atendimento", IF(I{r}="AGENDADA", "Acompanhar Deslocamento Técnico", "Monitorar Atendimento")))))))'
 
             ws_base.append([
                 cons_resp[i], f_prio, f_faixa, f_tat, f_peca, cod_os[i], ticket[i], demanda[i], status[i], dc, dt_concl_str[i],
@@ -509,16 +698,10 @@ if file_servico is not None:
 
         ws_base.freeze_panes = "F5"
         ws_base.auto_filter.ref = f"A4:W{n_rows+4}"
-        
-        col_widths_base = {
-            "A": 22, "B": 20, "C": 22, "D": 14, "E": 16, "F": 18, "G": 14, "H": 28, "I": 18,
-            "J": 18, "K": 18, "L": 22, "M": 18, "N": 35, "O": 20, "P": 8, "Q": 25,
-            "R": 24, "S": 35, "T": 24, "U": 35, "V": 30, "W": 40
-        }
-        for col_letter, width in col_widths_base.items():
-            ws_base.column_dimensions[col_letter].width = width
+        for col_l, w in {"A": 22, "B": 20, "C": 24, "D": 14, "E": 16, "F": 18, "G": 14, "H": 28, "I": 18, "J": 18, "K": 18, "L": 22, "M": 18, "N": 35, "O": 20, "P": 8, "Q": 25, "R": 24, "S": 35, "T": 24, "U": 35, "V": 30, "W": 44}.items():
+            ws_base.column_dimensions[col_l].width = w
 
-        # Aba Peças
+        # 3. ABA PEÇAS
         ws_pecas["A1"] = "PANASONIC DO BRASIL - CONTROLE ESPECÍFICO DE PEÇAS"
         ws_pecas["A1"].font = font_title
         headers_p = ["Consultora Responsável", "Código da OS", "Ticket", "Status Atual", "Tipo de Demanda", "Unidade Técnica (Rede)", "Cidade / UF", "Código da Peça", "Descrição da Peça", "Tipo de Registro", "Técnico de Campo", "Status Logístico Sugerido"]
@@ -544,9 +727,10 @@ if file_servico is not None:
         ws_pecas.auto_filter.ref = f"A4:L{count_p+4}"
         ws_pecas.freeze_panes = "D5"
 
-        # Aba Dashboard
+        # 4. ABA DASHBOARD
         ws_dash.views.sheetView[0].showGridLines = True
         ws_dash["A1"] = "PANASONIC DO BRASIL - PAINEL DE CONTROLE E GESTÃO DA REDE"; ws_dash["A1"].font = font_title
+        ws_dash["A2"] = f"Meta de 10 Dias: ≥ {META_10_DIAS:.0f}% | Data de Corte: {data_referencia.strftime('%d/%m/%Y')}"; ws_dash["A2"].font = font_sub
 
         def add_kpi(ws, col, title, form, fmt="#,##0"):
             ws.cell(row=4, column=col, value=title).font = Font(name="Segoe UI", size=9, bold=True, color="6B7280")
@@ -564,12 +748,11 @@ if file_servico is not None:
             ws.merge_cells(start_row=4, start_column=col, end_row=4, end_column=col+1)
             ws.merge_cells(start_row=5, start_column=col, end_row=6, end_column=col+1)
 
-        # KPIs Excel com as fórmulas requisitadas:
-        add_kpi(ws_dash, 1, "% ATÉ 10 DIAS", f'=COUNTIF(\'{nome_aba_base}\'!D5:D{n_rows+4}, "<=10") / MAX(1, COUNTA(\'{nome_aba_base}\'!D5:D{n_rows+4}))', "0.0%")
+        add_kpi(ws_dash, 1, "% ATÉ 10 DIAS (META ≥62%)", f'=COUNTIF(\'{nome_aba_base}\'!D5:D{n_rows+4}, "<=10") / MAX(1, COUNTA(\'{nome_aba_base}\'!D5:D{n_rows+4}))', "0.0%")
         add_kpi(ws_dash, 3, "% ATÉ 30 DIAS (CDC)", f'=COUNTIF(\'{nome_aba_base}\'!D5:D{n_rows+4}, "<=30") / MAX(1, COUNTA(\'{nome_aba_base}\'!D5:D{n_rows+4}))', "0.0%")
         add_kpi(ws_dash, 5, "TAT MÉDIO REPARO", f'=AVERAGEIFS(\'{nome_aba_base}\'!D5:D{n_rows+4}, \'{nome_aba_base}\'!I5:I{n_rows+4}, "CONCLUÍDA")', "0.0")
         add_kpi(ws_dash, 7, "% REINCIDENTES", f'=(COUNTIF(\'{nome_aba_base}\'!H5:H{n_rows+4}, "*REINCIDENCIA*") + COUNTIF(\'{nome_aba_base}\'!H5:H{n_rows+4}, "*REINCIDÊNCIA*")) / MAX(1, COUNTA(\'{nome_aba_base}\'!H5:H{n_rows+4}))', "0.00%")
-        add_kpi(ws_dash, 9, "TOTAL DE ORDENS", f'=COUNTA(\'{nome_aba_base}\'!F5:F{n_rows+4})', "#,##0")
+        add_kpi(ws_dash, 9, "TOTAL DE ORDENS", f'=COUNTA(\'{nome_aba_base}\'!F5:F{n_rows+4})\', "#,##0")
         add_kpi(ws_dash, 11, "ORDENS EM ABERTO", f'=COUNTIF(\'{nome_aba_base}\'!I5:I{n_rows+4}, "<>CONCLUÍDA") - COUNTIF(\'{nome_aba_base}\'!I5:I{n_rows+4}, "FINALIZADA") - COUNTIF(\'{nome_aba_base}\'!I5:I{n_rows+4}, "CANCELADA")', "#,##0")
 
         output = io.BytesIO()
@@ -580,22 +763,23 @@ if file_servico is not None:
     d_col1, d_col2 = st.columns(2)
     with d_col1:
         st.write("📊 **Planilha Geral Panasonic (Toda a Rede):**")
-        buf_geral = gerar_excel_completo(df_sorted, "Controle Operacional Geral")
+        buf_geral = gerar_excel_completo(df_sorted, df_ofensores, "Controle Operacional Geral")
         st.download_button(
-            label="📥 Baixar Excel Consolidado (Toda a Rede)",
+            label="📥 Baixar Excel Geral (Com Aba de Ofensores)",
             data=buf_geral,
-            file_name="Panasonic_Gestao_de_Rede_Consolidado.xlsx",
+            file_name=f"Panasonic_Gestao_Rede_Consolidado_{data_referencia.strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     with d_col2:
         if sel_consultoras:
             lbl_cons = ", ".join(sel_consultoras[:2]) + ("..." if len(sel_consultoras) > 2 else "")
             st.write(f"👩‍💼 **Carteira Selecionada ({lbl_cons}):**")
-            buf_cons = gerar_excel_completo(df_filtrado, "Base Consultoras Filtradas")
+            df_ofensores_sel = df_ofensores_view if len(df_ofensores_view) > 0 else df_ofensores
+            buf_cons = gerar_excel_completo(df_filtrado, df_ofensores_sel, "Base Consultoras Filtradas")
             st.download_button(
                 label=f"📥 Baixar Excel da(s) Consultora(s) Selecionada(s)",
                 data=buf_cons,
-                file_name="Panasonic_Gestao_Rede_Consultoras_Filtradas.xlsx",
+                file_name=f"Panasonic_Gestao_Rede_Filtradas_{data_referencia.strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         else:
