@@ -1,5 +1,6 @@
 import os
 import io
+import math
 import time
 from datetime import datetime, date
 import pandas as pd
@@ -150,6 +151,35 @@ def ler_arquivo(file):
     else:
         return pd.read_excel(file)
 
+# Função para calcular postos ofensores (< 62% em até 10 dias) sobre qualquer recorte de dados
+def calcular_ofensores(df_base):
+    df_val = df_base[df_base['Status Atual'].astype(str).str.strip().str.upper() != 'CANCELADA'].copy()
+    if len(df_val) == 0:
+        return pd.DataFrame(columns=['Unidade (Digiteam)', 'Consultora Responsável', 'Total_OS', 'OS_Ate_10d', 'TAT_Medio', 'Pct_10d', 'Status_Meta', 'Gap_OS_Meta'])
+    
+    df_val['Unidade_Limpa'] = df_val['Unidade (Digiteam)'].fillna('Não Informada').astype(str).str.strip()
+    df_val['Consultora_Limpa'] = df_val['Consultora Responsável'].fillna('Não Atribuída').astype(str).str.strip()
+    df_val['Ate_10d_Num'] = (df_val['TAT_Dias'] <= 10).astype(int)
+    
+    resumo = df_val.groupby(['Unidade_Limpa', 'Consultora_Limpa'], as_index=False).agg(
+        Total_OS=('Código OS', 'count'),
+        OS_Ate_10d=('Ate_10d_Num', 'sum'),
+        TAT_Medio=('TAT_Dias', 'mean')
+    )
+    resumo.rename(columns={'Unidade_Limpa': 'Unidade (Digiteam)', 'Consultora_Limpa': 'Consultora Responsável'}, inplace=True)
+    resumo['Pct_10d'] = (resumo['OS_Ate_10d'] / resumo['Total_OS']) * 100.0
+    resumo['Status_Meta'] = resumo['Pct_10d'].apply(
+        lambda x: "✅ Na Meta (≥ 62%)" if x >= META_10_DIAS else "❌ Ofensor (< 62%)"
+    )
+    resumo['Gap_OS_Meta'] = resumo.apply(
+        lambda r: max(0, int(math.ceil((META_10_DIAS / 100.0) * r['Total_OS']) - r['OS_Ate_10d'])),
+        axis=1
+    )
+    
+    df_of = resumo[resumo['Pct_10d'] < META_10_DIAS].copy()
+    df_of = df_of.sort_values(by=['Gap_OS_Meta', 'Pct_10d', 'Total_OS'], ascending=[False, True, False]).reset_index(drop=True)
+    return df_of
+
 # -------------------------------------------------------------
 # CONFIGURAÇÃO DE DATA DE CONSULTA NA BARRA LATERAL
 # -------------------------------------------------------------
@@ -176,6 +206,7 @@ if file_servico is not None:
 
         # Ordenar rigorosamente do mais antigo para o mais novo
         df_sorted = df_raw.sort_values(by='dt_criacao', ascending=True, na_position='last').reset_index(drop=True)
+        df_sorted['Unidade (Digiteam)'] = df_sorted['Unidade (Digiteam)'].fillna('Não Informada').astype(str).str.strip()
 
         # Mapeamento de Consultoras
         if file_consultoras is not None:
@@ -209,8 +240,6 @@ if file_servico is not None:
             df_sorted['Consultora Responsável'] = 'Não Atribuída (Insira a planilha 2)'
 
         # CÁLCULO PRECISO DO TAT:
-        # Se tem Conclusão/Finalização: usa Data Conclusão - Data Criação
-        # Se NÃO tem Conclusão (Aberta/Pendente): usa Data de Referência (Consulta/Hoje) - Data Criação
         dt_fim = df_sorted['dt_conclusao'].fillna(df_sorted['dt_finalizacao'])
         
         tat_dias = []
@@ -258,7 +287,7 @@ if file_servico is not None:
 
         # Matriz de Priorização Operacional
         def get_prioridade(row):
-            st_val = str(row.get('Status Atual', '')).strip()
+            st_val = str(row.get('Status Atual', '')).strip().upper()
             if st_val == 'CANCELADA': return 'BAIXA'
             if row['Is_Reincidente'] or row['TAT_Dias'] > 30: return 'CRÍTICA'
             if (row['Tem_Peca'] or row['TAT_Dias'] >= 3) and not row['Is_Reparado']: return 'ALTA'
@@ -321,7 +350,7 @@ if file_servico is not None:
     total_os = len(df_filtrado)
     
     # Base válida (desconsiderando canceladas)
-    df_validas = df_filtrado[df_filtrado['Status Atual'] != 'CANCELADA']
+    df_validas = df_filtrado[df_filtrado['Status Atual'].astype(str).str.strip().str.upper() != 'CANCELADA']
     total_validas = len(df_validas)
     
     # 1. Percentual com até 10 dias
@@ -417,47 +446,36 @@ if file_servico is not None:
     O cálculo considera o total de ordens válidas de cada posto e quanto falta para atingirem a meta de **62%**.
     """)
 
-    # Agregação por Posto
-    df_validas_postos = df_validas.copy()
-    df_validas_postos['Ate_10d_Num'] = (df_validas_postos['TAT_Dias'] <= 10).astype(int)
+    # Calcular ofensores tanto para a rede completa quanto para a visão filtrada atual
+    df_ofensores_geral = calcular_ofensores(df_sorted)
+    df_ofensores_filtrado = calcular_ofensores(df_filtrado)
     
-    resumo_postos = df_validas_postos.groupby(['Unidade (Digiteam)', 'Consultora Responsável']).agg(
-        Total_OS=('Código OS', 'count'),
-        OS_Ate_10d=('Ate_10d_Num', 'sum'),
-        TAT_Medio=('TAT_Dias', 'mean')
-    ).reset_index()
-
-    resumo_postos['Pct_10d'] = (resumo_postos['OS_Ate_10d'] / resumo_postos['Total_OS']) * 100
-    resumo_postos['Status_Meta'] = resumo_postos['Pct_10d'].apply(
-        lambda x: "✅ Na Meta (≥ 62%)" if x >= META_10_DIAS else "❌ Ofensor (< 62%)"
-    )
-    resumo_postos['Gap_OS_Meta'] = resumo_postos.apply(
-        lambda r: max(0, int(round((META_10_DIAS / 100.0 * r['Total_OS']) - r['OS_Ate_10d']))),
-        axis=1
-    )
-
-    df_ofensores = resumo_postos[resumo_postos['Pct_10d'] < META_10_DIAS].copy()
-    
-    c_filt_of1, c_filt_of2 = st.columns([2, 2])
+    # Opção de filtro de volume mínimo e busca direta por posto
+    c_filt_of1, c_filt_of2, c_filt_of3 = st.columns([2, 2, 1])
     with c_filt_of1:
+        max_os_posto = max(10, int(df_ofensores_filtrado['Total_OS'].max())) if len(df_ofensores_filtrado) > 0 else 10
         min_ordens = st.slider(
             "Filtrar postos com no mínimo de ordens:",
             min_value=1,
-            max_value=max(10, int(resumo_postos['Total_OS'].max())) if len(resumo_postos) > 0 else 10,
-            value=5,
-            help="Postos com poucas ordens podem distorcer o percentual. Ajuste para focar nos maiores volumes."
+            max_value=max_os_posto,
+            value=1,
+            help="Use 1 para listar TODOS os postos ofensores ou aumente para focar nos de maior volume."
         )
-    
-    df_ofensores_view = df_ofensores[df_ofensores['Total_OS'] >= min_ordens].sort_values(
-        by=['Pct_10d', 'Total_OS'],
-        ascending=[True, False]
-    )
-
     with c_filt_of2:
+        busca_posto = st.text_input("🔎 Buscar Posto Ofensor específico (ex: DUSO):", "")
+
+    df_ofensores_view = df_ofensores_filtrado[df_ofensores_filtrado['Total_OS'] >= min_ordens].copy()
+    if busca_posto:
+        df_ofensores_view = df_ofensores_view[
+            df_ofensores_view['Unidade (Digiteam)'].str.contains(busca_posto, case=False, na=False) |
+            df_ofensores_view['Consultora Responsável'].str.contains(busca_posto, case=False, na=False)
+        ]
+
+    with c_filt_of3:
         st.metric(
-            "Total de Postos Ofensores Identificados",
+            "Postos Ofensores",
             f"{len(df_ofensores_view)} postos",
-            f"{len(df_ofensores)} ofensores no total geral",
+            f"{len(df_ofensores_filtrado)} na seleção",
             delta_color="inverse"
         )
 
@@ -465,14 +483,14 @@ if file_servico is not None:
     if len(df_ofensores_view) > 0:
         col_g_of1, col_g_of2 = st.columns([3, 2])
         with col_g_of1:
-            top_15_ofensores = df_ofensores_view.head(15).copy()
+            top_15_ofensores = df_ofensores_view.sort_values(by=['Gap_OS_Meta', 'Pct_10d'], ascending=[False, True]).head(15).copy()
             fig_of = px.bar(
                 top_15_ofensores,
                 x='Pct_10d',
                 y='Unidade (Digiteam)',
                 orientation='h',
                 text='Pct_10d',
-                title=f"Top 15 Postos Mais Críticos (% Atendimento ≤ 10 Dias)",
+                title="Top 15 Maiores Ofensores por Impacto (Déficit de OS p/ Meta)",
                 color='Pct_10d',
                 color_continuous_scale='Reds_r'
             )
@@ -485,7 +503,7 @@ if file_servico is not None:
                 annotation_position="top right"
             )
             fig_of.update_layout(
-                yaxis={'categoryorder':'total descending'},
+                yaxis={'categoryorder':'total ascending'},
                 height=450,
                 xaxis_title="% de Atendimentos em até 10 Dias",
                 yaxis_title="Posto Autorizado",
@@ -569,7 +587,7 @@ if file_servico is not None:
     st.caption(f"Mostrando até 100 de {len(df_tabela)} ordens encontradas no filtro atual.")
 
     # -------------------------------------------------------------
-    # GERADOR DE EXCEL OFICIAL (.XLSX) COM ABA DE OFENSORES
+    # GERADOR DE EXCEL OFICIAL (.XLSX) COM ABA DE OFENSORES 100% SINCRONIZADA
     # -------------------------------------------------------------
     st.divider()
     st.subheader("📥 Exportação de Planilhas Formatadas (Padrão Panasonic)")
@@ -596,7 +614,11 @@ if file_servico is not None:
         thin_border = Side(border_style="thin", color=BORDER_GRAY)
         border_cell = Border(left=thin_border, right=thin_border, top=thin_border, bottom=thin_border)
 
-        # 1. ABA DE POSTOS OFENSORES
+        n_rows = len(df_export)
+        n_fim = str(n_rows + 4)
+        aba = str(nome_aba_base)
+
+        # 1. ABA DE POSTOS OFENSORES (COM FÓRMULAS DINÂMICAS SINCRONIZADAS COM A ABA BASE)
         ws_ofensores["A1"] = "PANASONIC DO BRASIL - POSTOS OFENSORES DO INDICADOR DE 10 DIAS"
         ws_ofensores["A1"].font = font_title
         ws_ofensores["A2"] = f"Meta Estabelecida: ≥ {META_10_DIAS:.0f}% de atendimentos em até 10 dias corridos | Data de Corte: {data_referencia.strftime('%d/%m/%Y')}"
@@ -609,35 +631,47 @@ if file_servico is not None:
         ws_ofensores.row_dimensions[4].height = 26
 
         for r_idx, r_data in enumerate(df_ofensores_exp.itertuples(), start=5):
-            ws_ofensores.cell(row=r_idx, column=1, value=r_data._1).border = border_cell
-            ws_ofensores.cell(row=r_idx, column=2, value=r_data._2).border = border_cell
+            r_str = str(r_idx)
+            posto_nome = str(r_data[1])
+            cons_nome = str(r_data[2])
+
+            ws_ofensores.cell(row=r_idx, column=1, value=posto_nome).border = border_cell
+            ws_ofensores.cell(row=r_idx, column=2, value=cons_nome).border = border_cell
             
-            c3 = ws_ofensores.cell(row=r_idx, column=3, value=r_data.Total_OS)
+            # Col C: Total de OS Válidas via fórmula COUNTIFS na aba base (Col N = Unidade, Col I = Status <> CANCELADA)
+            f_tot_val = '=COUNTIFS(\'' + aba + '\'!$N$5:$N$' + n_fim + ', A' + r_str + ', \'' + aba + '\'!$I$5:$I$' + n_fim + ', "<>CANCELADA")'
+            c3 = ws_ofensores.cell(row=r_idx, column=3, value=f_tot_val)
             c3.number_format = "#,##0"; c3.alignment = Alignment(horizontal="right"); c3.border = border_cell
             
-            c4 = ws_ofensores.cell(row=r_idx, column=4, value=r_data.OS_Ate_10d)
+            # Col D: OS em até 10 Dias via fórmula COUNTIFS (Col D <= 10)
+            f_ate_10 = '=COUNTIFS(\'' + aba + '\'!$N$5:$N$' + n_fim + ', A' + r_str + ', \'' + aba + '\'!$I$5:$I$' + n_fim + ', "<>CANCELADA", \'' + aba + '\'!$D$5:$D$' + n_fim + ', "<=10")'
+            c4 = ws_ofensores.cell(row=r_idx, column=4, value=f_ate_10)
             c4.number_format = "#,##0"; c4.alignment = Alignment(horizontal="right"); c4.border = border_cell
             
-            c5 = ws_ofensores.cell(row=r_idx, column=5, value=r_data.Pct_10d / 100.0)
+            # Col E: % Atingido
+            c5 = ws_ofensores.cell(row=r_idx, column=5, value='=IF(C' + r_str + '>0, D' + r_str + '/C' + r_str + ', 0)')
             c5.number_format = "0.0%"; c5.alignment = Alignment(horizontal="right"); c5.fill = fill_red; c5.font = font_bold; c5.border = border_cell
             
+            # Col F: Meta Target
             c6 = ws_ofensores.cell(row=r_idx, column=6, value=META_10_DIAS / 100.0)
             c6.number_format = "0.0%"; c6.alignment = Alignment(horizontal="right"); c6.border = border_cell
             
-            c7 = ws_ofensores.cell(row=r_idx, column=7, value="OFENSOR (< 62%)")
+            # Col G: Status Meta
+            c7 = ws_ofensores.cell(row=r_idx, column=7, value='=IF(E' + r_str + '>=F' + r_str + ', "NA META (≥ 62%)", "OFENSOR (< 62%)")')
             c7.alignment = Alignment(horizontal="center"); c7.border = border_cell
             
-            c8 = ws_ofensores.cell(row=r_idx, column=8, value=r_data.Gap_OS_Meta)
+            # Col H: Déficit de OS p/ Meta
+            c8 = ws_ofensores.cell(row=r_idx, column=8, value='=MAX(0, ROUNDUP(C' + r_str + '*F' + r_str + ', 0)-D' + r_str + ')')
             c8.number_format = "#,##0"; c8.alignment = Alignment(horizontal="right"); c8.border = border_cell
             ws_ofensores.row_dimensions[r_idx].height = 20
 
         ws_ofensores.freeze_panes = "C5"
-        ws_ofensores.auto_filter.ref = f"A4:H{len(df_ofensores_exp)+4}"
-        for col_l, w in {"A": 38, "B": 22, "C": 18, "D": 18, "E": 14, "F": 14, "G": 18, "H": 22}.items():
+        ws_ofensores.auto_filter.ref = f"A4:H{max(5, len(df_ofensores_exp)+4)}"
+        for col_l, w in {"A": 42, "B": 24, "C": 18, "D": 18, "E": 14, "F": 14, "G": 18, "H": 22}.items():
             ws_ofensores.column_dimensions[col_l].width = w
 
         # 2. ABA BASE
-        ws_base["A1"] = f"PANASONIC DO BRASIL - GESTÃO DE REDE & PÓS-VENDA"
+        ws_base["A1"] = "PANASONIC DO BRASIL - GESTÃO DE REDE & PÓS-VENDA"
         ws_base["A1"].font = font_title
         ws_base["A2"] = f"Acompanhamento Operacional | Data de Corte: {data_referencia.strftime('%d/%m/%Y')} | Ordenado do mais antigo para o mais novo"
         ws_base["A2"].font = font_sub
@@ -654,7 +688,6 @@ if file_servico is not None:
             c.font = font_header; c.fill = fill_header; c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         ws_base.row_dimensions[4].height = 26
 
-        n_rows = len(df_export)
         cod_os = df_export['Código OS'].astype(str).tolist()
         ticket = df_export.get('Número do Ticket', pd.Series(['']*n_rows)).fillna('').astype(str).str.replace(r'\.0$', '', regex=True).tolist()
         demanda = df_export.get('Tipo de Demanda', pd.Series(['']*n_rows)).fillna('').astype(str).tolist()
@@ -664,7 +697,7 @@ if file_servico is not None:
         dt_concl_str = [d.strftime('%Y-%m-%d %H:%M') if pd.notna(d) else '' for d in dt_concl_comb]
         cat = df_export.get('Categoria do Produto', pd.Series(['']*n_rows)).fillna('').astype(str).tolist()
         mod = df_export.get('Modelo do Produto', pd.Series(['']*n_rows)).fillna('').astype(str).tolist()
-        unid = df_export.get('Unidade (Digiteam)', pd.Series(['']*n_rows)).fillna('').astype(str).tolist()
+        unid = df_export['Unidade (Digiteam)'].fillna('').astype(str).tolist()
         cid = df_export.get('Cidade', pd.Series(['']*n_rows)).fillna('').astype(str).tolist()
         uf = df_export.get('Estado', pd.Series(['']*n_rows)).fillna('').astype(str).str.upper().tolist()
         tec = df_export.get('Agente de Campo', pd.Series(['']*n_rows)).fillna('').astype(str).tolist()
@@ -692,7 +725,7 @@ if file_servico is not None:
 
         ws_base.freeze_panes = "F5"
         ws_base.auto_filter.ref = f"A4:W{n_rows+4}"
-        for col_l, w in {"A": 22, "B": 20, "C": 24, "D": 14, "E": 16, "F": 18, "G": 14, "H": 28, "I": 18, "J": 18, "K": 18, "L": 22, "M": 18, "N": 35, "O": 20, "P": 8, "Q": 25, "R": 24, "S": 35, "T": 24, "U": 35, "V": 30, "W": 44}.items():
+        for col_l, w in {"A": 22, "B": 20, "C": 24, "D": 14, "E": 16, "F": 18, "G": 14, "H": 28, "I": 18, "J": 18, "K": 18, "L": 22, "M": 18, "N": 38, "O": 20, "P": 8, "Q": 25, "R": 24, "S": 35, "T": 24, "U": 35, "V": 30, "W": 44}.items():
             ws_base.column_dimensions[col_l].width = w
 
         # 3. ABA PEÇAS
@@ -718,7 +751,7 @@ if file_servico is not None:
                     ws_pecas.append([c_resp, cod_os[i], ticket[i], st_val, demanda[i], unid[i], cid_uf, c_pt[i], d_pt[i], "Troca de Peça Efetuada em Campo", tec[i], st_log])
                     count_p += 1
 
-        ws_pecas.auto_filter.ref = f"A4:L{count_p+4}"
+        ws_pecas.auto_filter.ref = f"A4:L{max(5, count_p+4)}"
         ws_pecas.freeze_panes = "D5"
 
         # 4. ABA DASHBOARD
@@ -742,13 +775,12 @@ if file_servico is not None:
             ws.merge_cells(start_row=4, start_column=col, end_row=4, end_column=col+1)
             ws.merge_cells(start_row=5, start_column=col, end_row=6, end_column=col+1)
 
-        n_fim = str(n_rows + 4)
-        aba = str(nome_aba_base)
-        
-        f_kpi_10d = '=COUNTIF(\'' + aba + '\'!D5:D' + n_fim + ', "<=10") / MAX(1, COUNTA(\'' + aba + '\'!D5:D' + n_fim + '))'
-        f_kpi_30d = '=COUNTIF(\'' + aba + '\'!D5:D' + n_fim + ', "<=30") / MAX(1, COUNTA(\'' + aba + '\'!D5:D' + n_fim + '))'
-        f_kpi_reparo = '=AVERAGEIFS(\'' + aba + '\'!D5:D' + n_fim + ', \'' + aba + '\'!I5:I' + n_fim + ', "CONCLUÍDA")'
-        f_kpi_reinc = '=(COUNTIF(\'' + aba + '\'!H5:H' + n_fim + ', "*REINCIDENCIA*") + COUNTIF(\'' + aba + '\'!H5:H' + n_fim + ', "*REINCIDÊNCIA*")) / MAX(1, COUNTA(\'' + aba + '\'!H5:H' + n_fim + '))'
+        # Fórmulas KPIs sincronizadas (excluindo CANCELADA das taxas e somando CONCLUÍDA + FINALIZADA no reparo)
+        f_valid_denom = 'MAX(1, COUNTIF(\'' + aba + '\'!I5:I' + n_fim + ', "<>CANCELADA"))'
+        f_kpi_10d = '=COUNTIFS(\'' + aba + '\'!D5:D' + n_fim + ', "<=10", \'' + aba + '\'!I5:I' + n_fim + ', "<>CANCELADA") / ' + f_valid_denom
+        f_kpi_30d = '=COUNTIFS(\'' + aba + '\'!D5:D' + n_fim + ', "<=30", \'' + aba + '\'!I5:I' + n_fim + ', "<>CANCELADA") / ' + f_valid_denom
+        f_kpi_reparo = '=(SUMIFS(\'' + aba + '\'!D5:D' + n_fim + ', \'' + aba + '\'!I5:I' + n_fim + ', "CONCLUÍDA") + SUMIFS(\'' + aba + '\'!D5:D' + n_fim + ', \'' + aba + '\'!I5:I' + n_fim + ', "FINALIZADA")) / MAX(1, COUNTIF(\'' + aba + '\'!I5:I' + n_fim + ', "CONCLUÍDA") + COUNTIF(\'' + aba + '\'!I5:I' + n_fim + ', "FINALIZADA"))'
+        f_kpi_reinc = '=(COUNTIFS(\'' + aba + '\'!H5:H' + n_fim + ', "*REINCIDENCIA*", \'' + aba + '\'!I5:I' + n_fim + ', "<>CANCELADA") + COUNTIFS(\'' + aba + '\'!H5:H' + n_fim + ', "*REINCIDÊNCIA*", \'' + aba + '\'!I5:I' + n_fim + ', "<>CANCELADA")) / ' + f_valid_denom
         f_kpi_total = '=COUNTA(\'' + aba + '\'!F5:F' + n_fim + ')'
         f_kpi_aberto = '=COUNTIF(\'' + aba + '\'!I5:I' + n_fim + ', "<>CONCLUÍDA") - COUNTIF(\'' + aba + '\'!I5:I' + n_fim + ', "FINALIZADA") - COUNTIF(\'' + aba + '\'!I5:I' + n_fim + ', "CANCELADA")'
 
@@ -767,7 +799,7 @@ if file_servico is not None:
     d_col1, d_col2 = st.columns(2)
     with d_col1:
         st.write("📊 **Planilha Geral Panasonic (Toda a Rede):**")
-        buf_geral = gerar_excel_completo(df_sorted, df_ofensores, "Controle Operacional Geral")
+        buf_geral = gerar_excel_completo(df_sorted, df_ofensores_geral, "Controle Operacional Geral")
         st.download_button(
             label="📥 Baixar Excel Geral (Com Aba de Ofensores)",
             data=buf_geral,
@@ -775,18 +807,16 @@ if file_servico is not None:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     with d_col2:
-        if sel_consultoras:
-            lbl_cons = ", ".join(sel_consultoras[:2]) + ("..." if len(sel_consultoras) > 2 else "")
-            st.write(f"👩‍💼 **Carteira Selecionada ({lbl_cons}):**")
-            df_ofensores_sel = df_ofensores_view if len(df_ofensores_view) > 0 else df_ofensores
-            buf_cons = gerar_excel_completo(df_filtrado, df_ofensores_sel, "Base Consultoras Filtradas")
+        if sel_consultoras or sel_demanda or sel_faixas or sel_status or sel_prio or sel_uf:
+            st.write("👩‍💼 **Carteira / Recorte Filtrado Atual:**")
+            buf_cons = gerar_excel_completo(df_filtrado, df_ofensores_filtrado, "Base Operacional Filtrada")
             st.download_button(
-                label=f"📥 Baixar Excel da(s) Consultora(s) Selecionada(s)",
+                label="📥 Baixar Excel Apenas do Filtro Atual",
                 data=buf_cons,
-                file_name=f"Panasonic_Gestao_Rede_Filtradas_{data_referencia.strftime('%Y%m%d')}.xlsx",
+                file_name=f"Panasonic_Gestao_Rede_Filtrada_{data_referencia.strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         else:
-            st.info("💡 Selecione uma ou mais consultoras na barra lateral para habilitar o download filtrado da carteira delas.")
+            st.info("💡 Aplique qualquer filtro na barra lateral (ex: Consultora, UF, Status) para habilitar o download exclusivo desse recorte.")
 else:
     st.info("👆 Por favor, envie o relatório de ordens de serviço acima para iniciar o painel.")
